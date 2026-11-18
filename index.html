@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aplin Sailing – Around the World</title>
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.8.0/mapbox-gl.css" rel="stylesheet">
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.8.0/mapbox-gl.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 2; max-width: 280px;
+    background: rgba(255,255,255,0.94); border-radius: 10px; padding: 14px 16px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.18); font-size: 14px; line-height: 1.4;
+  }
+  #panel h1 { font-size: 17px; margin: 0 0 8px; color: #0b3d5c; }
+  #panel .row { display: flex; justify-content: space-between; gap: 12px; }
+  #panel .label { color: #667; }
+  #panel .val { font-weight: 600; text-align: right; }
+  #panel .note { margin-top: 8px; color: #333; font-style: italic; }
+  #panel .err { color: #b00020; }
+  .boat {
+    width: 16px; height: 16px; border-radius: 50%; background: #e4572e;
+    border: 3px solid #fff; box-shadow: 0 0 0 0 rgba(228,87,46,0.6);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(228,87,46,0.6); }
+    70% { box-shadow: 0 0 0 16px rgba(228,87,46,0); }
+    100% { box-shadow: 0 0 0 0 rgba(228,87,46,0); }
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel"><h1>⛵ Aplin Sailing</h1><div id="stats">Loading positions…</div></div>
+
+<script>
+/* ===================== SETTINGS – fill these in ===================== */
+// 1. Your Mapbox PUBLIC token (starts with pk.) – Mapbox account > Tokens.
+//    Restrict it to your site's URL in the token settings.
+const MAPBOX_TOKEN = 'pk.eyJ1Ijoibnl4Y2x1ZmYiLCJhIjoiY213bGg0c2xnMDhwajJ6b2pzamFzOXV3ZCJ9.hznKwbPapP_vmozyfadH5Q';
+
+// 2. Basemap. Use a Mapbox default, or the style URL of a style you save in
+//    your "Aplin Sailing" folder in Mapbox Studio (Share > Style URL).
+const MAP_STYLE = 'mapbox://styles/mapbox/outdoors-v12';
+
+// 3. The Google Sheet that holds the positions (already set up).
+//    The sheet must be shared as "Anyone with the link – Viewer".
+const SHEET_ID = '1mhu-uelmyat0slqV-llbGlLJwoesWKciTHTn0Oz21z8';
+/* ==================================================================== */
+
+const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&_=${Date.now()}`;
+
+// Accepts decimal degrees (-33.86, 151.2) or DMS / degrees-decimal-minutes
+// such as 33°51.6'S, 151 12 30 E, S33 51.6
+function parseCoord(raw) {
+  if (raw == null) return NaN;
+  let s = String(raw).trim().toUpperCase();
+  if (s === '') return NaN;
+  const neg = /[SW]/.test(s) || s.startsWith('-');
+  const nums = s.replace(/[NSEW°'"′″,]/g, ' ').replace(/^-/, '').trim().split(/\s+/).map(Number);
+  if (nums.some(isNaN)) return NaN;
+  const v = (nums[0] || 0) + (nums[1] || 0) / 60 + (nums[2] || 0) / 3600;
+  return neg ? -v : v;
+}
+
+function parseCSV(text) {
+  const rows = []; let row = [], field = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') q = false;
+      else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); rows.push(row); row = []; field = '';
+    } else field += c;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Great-circle distance in nautical miles
+function nm(a, b) {
+  const R = 3440.065, r = Math.PI / 180;
+  const dLat = (b[1] - a[1]) * r, dLon = (b[0] - a[0]) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a[1] * r) * Math.cos(b[1] * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function fmtDDM(v, pos, neg) {
+  const h = v < 0 ? neg : pos; v = Math.abs(v);
+  const d = Math.floor(v), m = (v - d) * 60;
+  return `${d}° ${m.toFixed(2)}′ ${h}`;
+}
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+mapboxgl.accessToken = MAPBOX_TOKEN;
+const map = new mapboxgl.Map({ container: 'map', style: MAP_STYLE, projection: 'globe', center: [150, -20], zoom: 1.6 });
+map.addControl(new mapboxgl.NavigationControl(), 'top-right');
+map.addControl(new mapboxgl.ScaleControl({ unit: 'nautical' }));
+
+map.on('load', async () => {
+  const statsEl = document.getElementById('stats');
+  let pts;
+  try {
+    const res = await fetch(CSV_URL);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const rows = parseCSV(await res.text());
+    const head = rows.shift().map(h => h.trim().toLowerCase());
+    const col = n => head.indexOf(n);
+    pts = rows.map(r => ({
+      date: r[col('date')]?.trim(), time: r[col('time_utc')]?.trim(),
+      lat: parseCoord(r[col('lat')]), lon: parseCoord(r[col('lon')]), notes: r[col('notes')]?.trim()
+    })).filter(p => isFinite(p.lat) && isFinite(p.lon) && Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180);
+  } catch (e) {
+    statsEl.innerHTML = `<span class="err">Couldn't read the position sheet (${esc(e.message)}). Check it's shared as "Anyone with the link – Viewer".</span>`;
+    return;
+  }
+  if (!pts.length) { statsEl.textContent = 'No positions yet – add the first row to the sheet.'; return; }
+
+  // Keep sheet order (chronological). Unwrap longitudes so the track
+  // doesn't jump across the map when crossing the 180° meridian.
+  const line = []; let prev = null;
+  for (const p of pts) {
+    let lon = p.lon;
+    if (prev !== null) { while (lon - prev > 180) lon -= 360; while (lon - prev < -180) lon += 360; }
+    line.push([lon, p.lat]); prev = lon;
+  }
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) total += nm([pts[i - 1].lon, pts[i - 1].lat], [pts[i].lon, pts[i].lat]);
+
+  const features = pts.map((p, i) => ({
+    type: 'Feature', geometry: { type: 'Point', coordinates: line[i] },
+    properties: { day: i + 1, date: p.date || '', time: p.time || '', notes: p.notes || '',
+      pos: `${fmtDDM(p.lat, 'N', 'S')}, ${fmtDDM(p.lon, 'E', 'W')}` }
+  }));
+
+  map.addSource('track', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: line } } });
+  map.addLayer({ id: 'track', type: 'line', source: 'track',
+    paint: { 'line-color': '#e4572e', 'line-width': 2.5, 'line-dasharray': [2, 1] } });
+  map.addSource('positions', { type: 'geojson', data: { type: 'FeatureCollection', features } });
+  map.addLayer({ id: 'positions', type: 'circle', source: 'positions',
+    paint: { 'circle-radius': 4.5, 'circle-color': '#0b3d5c', 'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5 } });
+
+  map.on('click', 'positions', e => {
+    const p = e.features[0].properties;
+    new mapboxgl.Popup().setLngLat(e.features[0].geometry.coordinates)
+      .setHTML(`<strong>Day ${p.day}</strong> – ${esc(p.date)} ${esc(p.time)}${p.time ? ' UTC' : ''}<br>${esc(p.pos)}${p.notes ? '<br><em>' + esc(p.notes) + '</em>' : ''}`)
+      .addTo(map);
+  });
+  map.on('mouseenter', 'positions', () => map.getCanvas().style.cursor = 'pointer');
+  map.on('mouseleave', 'positions', () => map.getCanvas().style.cursor = '');
+
+  const last = pts[pts.length - 1], lastXY = line[line.length - 1];
+  const el = document.createElement('div'); el.className = 'boat';
+  new mapboxgl.Marker({ element: el }).setLngLat(lastXY).addTo(map);
+
+  statsEl.innerHTML = `
+    <div class="row"><span class="label">Latest</span><span class="val">${esc(last.date)} ${esc(last.time)}${last.time ? ' UTC' : ''}</span></div>
+    <div class="row"><span class="label">Position</span><span class="val">${fmtDDM(last.lat, 'N', 'S')}<br>${fmtDDM(last.lon, 'E', 'W')}</span></div>
+    <div class="row"><span class="label">Positions logged</span><span class="val">${pts.length}</span></div>
+    <div class="row"><span class="label">Distance (great-circle)</span><span class="val">${Math.round(total).toLocaleString()} nm</span></div>
+    ${last.notes ? `<div class="note">“${esc(last.notes)}”</div>` : ''}`;
+
+  map.flyTo({ center: lastXY, zoom: 3.5, duration: 2500 });
+});
+</script>
+</body>
+</html>
